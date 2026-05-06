@@ -31,22 +31,36 @@
 //! [gRPC]: https://grpc.io
 #![allow(dead_code, unused_variables)]
 
+pub mod attributes;
 pub mod client;
 pub mod core;
 pub mod credentials;
 pub mod inmemory;
+pub mod metadata;
+pub mod server;
+
 mod macros;
 mod status;
-pub use status::ServerStatus;
+
+pub use status::ServerStatusErr;
 pub use status::Status;
-pub use status::StatusCode;
-mod attributes;
+pub use status::StatusCodeError;
+pub use status::StatusError;
+pub use status::StatusOr;
+
 mod byte_str;
-mod codec;
 mod rt;
 mod send_future;
-pub mod server;
-pub mod service;
+
+mod private {
+    /// A zero-sized type used to seal methods on a public trait.
+    ///
+    /// Because this type is private to this crate, it cannot be constructed or
+    /// named by external crates. As a result, any method requiring an `Internal`
+    /// argument becomes uncallable from outside the crate.
+    pub struct Internal;
+}
+
 #[cfg(test)]
 mod echo_pb {
     include!(concat!(

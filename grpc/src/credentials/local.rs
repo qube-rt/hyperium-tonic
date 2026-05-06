@@ -28,12 +28,12 @@ use std::sync::Arc;
 
 use crate::attributes::Attributes;
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
+use crate::client::name_resolution::UNIX_NETWORK_TYPE;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::ProtocolInfo;
 use crate::credentials::SecurityLevel;
 use crate::credentials::ServerCredentials;
 use crate::credentials::call::CallCredentials;
-use crate::credentials::client;
 use crate::credentials::client::ClientConnectionSecurityContext;
 use crate::credentials::client::ClientConnectionSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
@@ -41,6 +41,7 @@ use crate::credentials::client::HandshakeOutput;
 use crate::credentials::common::Authority;
 use crate::credentials::server;
 use crate::credentials::server::ServerConnectionSecurityInfo;
+use crate::private;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 
@@ -57,9 +58,14 @@ pub struct LocalChannelCredentials {
 }
 
 impl LocalChannelCredentials {
-    /// Creates a new instance of `InsecureChannelCredentials`.
+    /// Creates a new instance of `LocalChannelCredentials`.
     pub fn new() -> Self {
         Self { _private: () }
+    }
+
+    /// Creates a new ref-counted instance of `LocalChannelCredentials`.
+    pub fn new_arc() -> Arc<Self> {
+        Arc::new(Self { _private: () })
     }
 }
 
@@ -89,14 +95,24 @@ fn security_level_for_endpoint(
     {
         return Ok(SecurityLevel::NoSecurity);
     }
-    // TODO: Add support for unix sockets.
+    if network_type == UNIX_NETWORK_TYPE {
+        // Abstract Unix sockets are not protected by file system permissions.
+        // The application is responsible for authorizing connections via
+        // SO_PEERCRED.
+        // TODO: Consider increasing the security level once gRPC supports
+        // SO_PEERCRED.
+        if peer_addr.starts_with("\0") {
+            return Ok(SecurityLevel::NoSecurity);
+        }
+        return Ok(SecurityLevel::PrivacyAndIntegrity);
+    }
     Err(format!(
         "local credentials rejected connection to non-local address {}",
         peer_addr
     ))
 }
 
-impl client::ChannelCredsInternal for LocalChannelCredentials {
+impl ChannelCredentials for LocalChannelCredentials {
     type ContextType = LocalConnectionSecurityContext;
     type Output<I> = I;
 
@@ -104,8 +120,9 @@ impl client::ChannelCredsInternal for LocalChannelCredentials {
         &self,
         _authority: &Authority,
         source: Input,
-        _info: ClientHandshakeInfo,
-        _runtime: GrpcRuntime,
+        _info: &ClientHandshakeInfo,
+        _runtime: &GrpcRuntime,
+        _token: private::Internal,
     ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
         let security_level =
             security_level_for_endpoint(source.get_peer_address(), source.get_network_type())?;
@@ -120,15 +137,13 @@ impl client::ChannelCredsInternal for LocalChannelCredentials {
         })
     }
 
-    fn get_call_credentials(&self) -> Option<&Arc<dyn CallCredentials>> {
-        None
-    }
-}
-
-impl ChannelCredentials for LocalChannelCredentials {
     fn info(&self) -> &ProtocolInfo {
         static INFO: ProtocolInfo = ProtocolInfo::new(PROTOCOL_NAME);
         &INFO
+    }
+
+    fn get_call_credentials(&self, _: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
+        None
     }
 }
 
@@ -144,13 +159,14 @@ impl LocalServerCredentials {
     }
 }
 
-impl server::ServerCredsInternal for LocalServerCredentials {
+impl ServerCredentials for LocalServerCredentials {
     type Output<I> = I;
 
     async fn accept<Input: GrpcEndpoint>(
         &self,
         source: Input,
         _runtime: GrpcRuntime,
+        _token: private::Internal,
     ) -> Result<server::HandshakeOutput<Self::Output<Input>>, String> {
         let security_level =
             security_level_for_endpoint(source.get_peer_address(), source.get_network_type())?;
@@ -163,9 +179,7 @@ impl server::ServerCredsInternal for LocalServerCredentials {
             ),
         })
     }
-}
 
-impl ServerCredentials for LocalServerCredentials {
     fn info(&self) -> &ProtocolInfo {
         static INFO: ProtocolInfo = ProtocolInfo::new(PROTOCOL_NAME);
         &INFO
@@ -183,14 +197,14 @@ mod test {
     use crate::credentials::ChannelCredentials;
     use crate::credentials::SecurityLevel;
     use crate::credentials::ServerCredentials;
-    use crate::credentials::client::ChannelCredsInternal as ClientSealed;
     use crate::credentials::client::ClientConnectionSecurityContext;
     use crate::credentials::client::ClientHandshakeInfo;
     use crate::credentials::common::Authority;
-    use crate::credentials::server::ServerCredsInternal;
     use crate::rt;
+    use crate::rt::AsyncIoAdapter;
     use crate::rt::GrpcEndpoint;
     use crate::rt::TcpOptions;
+    use crate::rt::tokio::TokioIoStream;
 
     #[test]
     fn test_security_level_for_endpoint_success() {
@@ -202,12 +216,19 @@ mod test {
             security_level_for_endpoint("[::1]:8080", TCP_IP_NETWORK_TYPE),
             Ok(SecurityLevel::NoSecurity)
         );
+        assert_eq!(
+            security_level_for_endpoint("/file/path/name.sock", UNIX_NETWORK_TYPE),
+            Ok(SecurityLevel::PrivacyAndIntegrity)
+        );
+        assert_eq!(
+            security_level_for_endpoint("\0abstract-sock", UNIX_NETWORK_TYPE),
+            Ok(SecurityLevel::NoSecurity)
+        );
     }
 
     #[test]
     fn test_security_level_for_endpoint_failure() {
         assert!(security_level_for_endpoint("192.168.1.1:8080", TCP_IP_NETWORK_TYPE).is_err());
-        assert!(security_level_for_endpoint("127.0.0.1:8080", "unix").is_err());
         assert!(security_level_for_endpoint("invalid", TCP_IP_NETWORK_TYPE).is_err());
     }
 
@@ -231,11 +252,17 @@ mod test {
         let handshake_info = ClientHandshakeInfo::default();
 
         let output = creds
-            .connect(&authority, endpoint, handshake_info, runtime)
+            .connect(
+                &authority,
+                endpoint,
+                &handshake_info,
+                &runtime,
+                private::Internal,
+            )
             .await
             .unwrap();
 
-        let mut endpoint = output.endpoint;
+        let endpoint = output.endpoint;
         let security_info = output.security;
 
         // Verify security info.
@@ -252,7 +279,10 @@ mod test {
         server_stream.write_all(test_data).await.unwrap();
 
         let mut buf = vec![0u8; test_data.len()];
-        endpoint.read_exact(&mut buf).await.unwrap();
+        AsyncIoAdapter::new(endpoint)
+            .read_exact(&mut buf)
+            .await
+            .unwrap();
         assert_eq!(buf, test_data);
 
         // Validate arbitrary authority.
@@ -272,11 +302,8 @@ mod test {
 
         let addr = "127.0.0.1:0";
         let runtime = rt::default_runtime();
-        let mut listener = runtime
-            .listen_tcp(addr.parse().unwrap(), TcpOptions::default())
-            .await
-            .unwrap();
-        let server_addr = *listener.local_addr();
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
 
         let client_handle = tokio::spawn(async move {
             let mut stream = TcpStream::connect(server_addr).await.unwrap();
@@ -288,17 +315,24 @@ mod test {
             let _ = stream.read(&mut buf).await;
         });
 
-        let (server_stream, _) = listener.accept().await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let server_stream = TokioIoStream::new_from_tcp(stream).unwrap();
 
-        let output = creds.accept(server_stream, runtime).await.unwrap();
-        let mut endpoint = output.endpoint;
+        let output = creds
+            .accept(server_stream, runtime, private::Internal)
+            .await
+            .unwrap();
+        let endpoint = output.endpoint;
         let security_info = output.security;
 
         assert_eq!(security_info.security_protocol(), "local");
         assert_eq!(security_info.security_level(), SecurityLevel::NoSecurity);
 
         let mut buf = vec![0u8; 10];
-        endpoint.read_exact(&mut buf).await.unwrap();
+        AsyncIoAdapter::new(endpoint)
+            .read_exact(&mut buf)
+            .await
+            .unwrap();
         assert_eq!(&buf[..], b"hello grpc");
 
         client_handle.abort();

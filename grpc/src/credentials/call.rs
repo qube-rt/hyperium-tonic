@@ -25,10 +25,10 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use tonic::Status;
 use tonic::async_trait;
 use tonic::metadata::MetadataMap;
 
+use crate::StatusError;
 use crate::attributes::Attributes;
 use crate::credentials::SecurityLevel;
 
@@ -42,10 +42,10 @@ pub struct CallDetails {
 }
 
 impl CallDetails {
-    pub(crate) fn new(service_url: String, method_name: String) -> Self {
+    pub fn new(service_url: impl Into<String>, method_name: impl Into<String>) -> Self {
         Self {
-            service_url,
-            method_name,
+            service_url: service_url.into(),
+            method_name: method_name.into(),
         }
     }
 
@@ -60,15 +60,15 @@ impl CallDetails {
     }
 }
 
-pub struct ChannelSecurityInfo {
+pub struct ClientConnectionSecurityInfo {
     security_protocol: &'static str,
     security_level: SecurityLevel,
     /// Stores extra data derived from the underlying protocol.
     attributes: Attributes,
 }
 
-impl ChannelSecurityInfo {
-    pub(crate) fn new(
+impl ClientConnectionSecurityInfo {
+    pub fn new(
         security_protocol: &'static str,
         security_level: SecurityLevel,
         attributes: Attributes,
@@ -114,9 +114,9 @@ pub trait CallCredentials: Send + Sync + Debug {
     async fn get_metadata(
         &self,
         call_details: &CallDetails,
-        auth_info: &ChannelSecurityInfo,
+        auth_info: &ClientConnectionSecurityInfo,
         metadata: &mut MetadataMap,
-    ) -> Result<(), Status>;
+    ) -> Result<(), StatusError>;
 
     /// Indicates the minimum transport security level required to send
     /// these credentials.
@@ -155,9 +155,9 @@ impl CallCredentials for CompositeCallCredentials {
     async fn get_metadata(
         &self,
         call_details: &CallDetails,
-        auth_info: &ChannelSecurityInfo,
+        auth_info: &ClientConnectionSecurityInfo,
         metadata: &mut MetadataMap,
-    ) -> Result<(), Status> {
+    ) -> Result<(), StatusError> {
         for cred in &self.creds {
             cred.get_metadata(call_details, auth_info, metadata).await?;
         }
@@ -191,9 +191,9 @@ mod tests {
         async fn get_metadata(
             &self,
             _call_details: &CallDetails,
-            _auth_info: &ChannelSecurityInfo,
+            _auth_info: &ClientConnectionSecurityInfo,
             metadata: &mut MetadataMap,
-        ) -> Result<(), Status> {
+        ) -> Result<(), StatusError> {
             metadata.insert(
                 self.key
                     .parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>()
@@ -227,7 +227,7 @@ mod tests {
             service_url: "url".to_string(),
             method_name: "method".to_string(),
         };
-        let auth_info = ChannelSecurityInfo::new(
+        let auth_info = ClientConnectionSecurityInfo::new(
             "test",
             SecurityLevel::PrivacyAndIntegrity,
             Attributes::new(),

@@ -32,38 +32,9 @@ use crate::credentials::call::CallCredentials;
 use crate::credentials::call::CompositeCallCredentials;
 use crate::credentials::common::Authority;
 use crate::credentials::insecure;
+use crate::private;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
-
-#[trait_variant::make(Send)]
-pub trait ChannelCredsInternal {
-    type ContextType: ClientConnectionSecurityContext;
-    type Output<I>;
-    /// Performs the client-side authentication handshake on a raw endpoint.
-    ///
-    /// This method wraps the provided `source` endpoint with the security protocol
-    /// (e.g., TLS) and returns the authenticated endpoint along with its
-    /// security details.
-    ///
-    /// # Arguments
-    ///
-    /// * `authority` - The `:authority` header value to be used when creating
-    ///   new streams.
-    ///   **Important:** Implementations must use this value as the server name
-    ///   (e.g., for SNI) during the handshake.
-    /// * `source` - The raw connection handle.
-    /// * `info` - Additional context passed from the resolver or load balancer.
-    async fn connect<Input: GrpcEndpoint>(
-        &self,
-        authority: &Authority,
-        source: Input,
-        info: ClientHandshakeInfo,
-        runtime: GrpcRuntime,
-    ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String>;
-
-    /// Returns call credentials to be used for all RPCs made on a connection.
-    fn get_call_credentials(&self) -> Option<&Arc<dyn CallCredentials>>;
-}
 
 pub struct HandshakeOutput<T, C: ClientConnectionSecurityContext> {
     pub endpoint: T,
@@ -102,6 +73,9 @@ pub struct ClientConnectionSecurityInfo<C> {
     attributes: Attributes,
 }
 
+pub type DynClientConnectionSecurityInfo =
+    ClientConnectionSecurityInfo<Box<dyn ClientConnectionSecurityContext>>;
+
 impl<C> ClientConnectionSecurityInfo<C> {
     pub fn new(
         security_protocol: &'static str,
@@ -133,9 +107,7 @@ impl<C> ClientConnectionSecurityInfo<C> {
         &self.attributes
     }
 
-    pub fn into_boxed(
-        self,
-    ) -> ClientConnectionSecurityInfo<Box<dyn ClientConnectionSecurityContext>>
+    pub fn into_boxed(self) -> DynClientConnectionSecurityInfo
     where
         C: ClientConnectionSecurityContext + 'static,
     {
@@ -155,7 +127,7 @@ impl<C> ClientConnectionSecurityInfo<C> {
 ///
 /// Individual credential implementations are responsible for validating and
 /// interpreting the format of the data they receive.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ClientHandshakeInfo {
     /// The bag of attributes containing the handshake data.
     attributes: Attributes,
@@ -186,12 +158,13 @@ impl<T: ChannelCredentials> CompositeChannelCredentials<T> {
             return Err("using tokens on an insecure credentials is disallowed".to_string());
         }
 
-        let combined_call_creds = if let Some(existing) = channel_creds.get_call_credentials() {
-            let composite_creds = CompositeCallCredentials::new(existing.clone(), call_creds);
-            Arc::new(composite_creds)
-        } else {
-            call_creds
-        };
+        let combined_call_creds =
+            if let Some(existing) = channel_creds.get_call_credentials(private::Internal) {
+                let composite_creds = CompositeCallCredentials::new(existing.clone(), call_creds);
+                Arc::new(composite_creds)
+            } else {
+                call_creds
+            };
 
         Ok(Self {
             channel_creds,
@@ -200,7 +173,7 @@ impl<T: ChannelCredentials> CompositeChannelCredentials<T> {
     }
 }
 
-impl<T: ChannelCredentials> ChannelCredsInternal for CompositeChannelCredentials<T> {
+impl<T: ChannelCredentials> ChannelCredentials for CompositeChannelCredentials<T> {
     type ContextType = T::ContextType;
     type Output<I> = T::Output<I>;
 
@@ -208,37 +181,36 @@ impl<T: ChannelCredentials> ChannelCredsInternal for CompositeChannelCredentials
         &self,
         authority: &Authority,
         source: Input,
-        info: ClientHandshakeInfo,
-        runtime: GrpcRuntime,
+        info: &ClientHandshakeInfo,
+        runtime: &GrpcRuntime,
+        token: private::Internal,
     ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
         self.channel_creds
-            .connect(authority, source, info, runtime)
+            .connect(authority, source, info, runtime, token)
             .await
     }
 
-    fn get_call_credentials(&self) -> Option<&Arc<dyn CallCredentials>> {
-        Some(&self.call_creds)
-    }
-}
-
-impl<T: ChannelCredentials> ChannelCredentials for CompositeChannelCredentials<T> {
     fn info(&self) -> &ProtocolInfo {
         self.channel_creds.info()
+    }
+
+    fn get_call_credentials(&self, _: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
+        Some(&self.call_creds)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use tokio::net::TcpListener;
-    use tonic::Status;
     use tonic::async_trait;
     use tonic::metadata::MetadataMap;
     use tonic::metadata::MetadataValue;
 
     use super::*;
+    use crate::StatusError;
     use crate::credentials::call::CallCredentials;
     use crate::credentials::call::CallDetails;
-    use crate::credentials::call::ChannelSecurityInfo;
+    use crate::credentials::call::ClientConnectionSecurityInfo;
     use crate::credentials::insecure::InsecureChannelCredentials;
     use crate::credentials::local::LocalChannelCredentials;
     use crate::rt;
@@ -256,9 +228,9 @@ mod tests {
         async fn get_metadata(
             &self,
             _call_details: &CallDetails,
-            _auth_info: &ChannelSecurityInfo,
+            _auth_info: &ClientConnectionSecurityInfo,
             metadata: &mut MetadataMap,
-        ) -> Result<(), Status> {
+        ) -> Result<(), StatusError> {
             metadata.insert(
                 self.key
                     .parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>()
@@ -294,10 +266,13 @@ mod tests {
         let composite2 = CompositeChannelCredentials::new(composite1, call_creds2).unwrap();
 
         // Verify call credentials
-        let combined_call_creds = composite2.get_call_credentials().unwrap();
+        let combined_call_creds = composite2.get_call_credentials(private::Internal).unwrap();
         let call_details = CallDetails::new("service".to_string(), "method".to_string());
-        let auth_info =
-            ChannelSecurityInfo::new("local", SecurityLevel::NoSecurity, Attributes::new());
+        let auth_info = ClientConnectionSecurityInfo::new(
+            "local",
+            SecurityLevel::NoSecurity,
+            Attributes::new(),
+        );
         let mut metadata = MetadataMap::new();
 
         combined_call_creds
@@ -329,8 +304,9 @@ mod tests {
             .connect(
                 &authority,
                 endpoint,
-                ClientHandshakeInfo::default(),
-                runtime,
+                &ClientHandshakeInfo::default(),
+                &runtime,
+                private::Internal,
             )
             .await
             .unwrap();

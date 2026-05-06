@@ -31,7 +31,7 @@ use std::any::TypeId;
 use bytes::Buf;
 use tonic::metadata::MetadataMap;
 
-use crate::Status;
+use crate::status::Status;
 
 #[allow(unused)]
 pub trait SendMessage: Send + Sync {
@@ -101,23 +101,22 @@ impl dyn RecvMessage + '_ {
     }
 }
 
-/// ResponseStreamItem represents an item in a response stream (either server
-/// sending or client receiving).
+/// ClientResponseStreamItem represents an item in a response stream from the client's view.
 ///
 /// A response stream must always contain items exactly as follows:
 ///
 /// [Headers *Message] Trailers *StreamClosed
 ///
-/// That is: optionaly, a Headers value and any number of Message values
+/// That is: optionally, a Headers value and any number of Message values
 /// (including zero), followed by a required Trailers value.  A response stream
 /// should not be used after Trailers, but reads should return StreamClosed if
 /// it is.
 #[derive(Debug, Clone)]
-pub enum ResponseStreamItem<M> {
+pub enum ClientResponseStreamItem {
     /// Indicates the headers for the stream.
     Headers(ResponseHeaders),
     /// Indicates a message on the stream.
-    Message(M),
+    Message,
     /// Indicates trailers were received on the stream and includes the trailers.
     Trailers(Trailers),
     /// Indicates the response stream was closed.  Trailers must have been
@@ -125,13 +124,13 @@ pub enum ResponseStreamItem<M> {
     StreamClosed,
 }
 
-/// The client's view of a ResponseStream in a RecvStream: the message type is
-/// void as the received message is passed in via the `next` method.
-pub type ClientResponseStreamItem = ResponseStreamItem<()>;
-
-/// The server's view of a ResponseStream in a SendStream: the message type is
-/// part of the payload provided to the `send` method.
-pub type ServerResponseStreamItem<'a> = ResponseStreamItem<&'a dyn SendMessage>;
+/// The server's view of a ResponseStream in a SendStream, using references to avoid allocations.
+pub enum ServerResponseStreamItem<'a> {
+    /// Indicates the headers for the stream.
+    Headers(ResponseHeaders),
+    /// Indicates a message on the stream.
+    Message(&'a dyn SendMessage),
+}
 
 /// Contains all information transmitted in the response headers of an RPC.
 #[derive(Debug, Clone, Default)]
@@ -220,7 +219,7 @@ pub struct Trailers {
 }
 
 impl Trailers {
-    /// Returns a default RequestHeaders instance.
+    /// Returns a default [`Trailers`] instance.
     pub fn new(status: Status) -> Self {
         Self {
             status,
@@ -234,7 +233,7 @@ impl Trailers {
         self
     }
 
-    /// Returns a reference to the status contained in these trailers.
+    /// Returns a reference to the [`Status`] contained in these trailers.
     pub fn status(&self) -> &Status {
         &self.status
     }
@@ -253,5 +252,10 @@ impl Trailers {
     /// Returns a reference to the metadata in these trailers.
     pub fn metadata(&self) -> &MetadataMap {
         &self.metadata
+    }
+
+    /// Returns the status in the [`Trailers`], consuming the entire status.
+    pub fn into_status(self) -> Status {
+        self.status
     }
 }
